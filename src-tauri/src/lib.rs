@@ -80,10 +80,38 @@ pub struct EditorFontSettings {
     pub line_height: Option<f32>,         // default 1.6
 }
 
-// App config (stored in app data directory - just the notes folder path)
+// Pad configuration (one entry per connected folder/repo)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PadConfig {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    #[serde(default = "default_file_extensions")]
+    pub file_extensions: Vec<String>,
+}
+
+fn default_file_extensions() -> Vec<String> {
+    vec!["md".to_string()]
+}
+
+// App config (stored in app data directory)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    #[serde(default)]
+    pub pads: Vec<PadConfig>,
+    pub active_pad_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub notes_folder: Option<String>,
+}
+
+// Response type for list_pads command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PadsInfo {
+    pub pads: Vec<PadConfig>,
+    pub active_pad_id: Option<String>,
 }
 
 // Per-folder settings (stored in .scratch/settings.json within notes folder)
@@ -255,7 +283,7 @@ impl SearchIndex {
         Ok(results)
     }
 
-    fn rebuild_index(&self, notes_folder: &PathBuf) -> Result<()> {
+    fn rebuild_index(&self, notes_folder: &PathBuf, extensions: &[String]) -> Result<()> {
         let mut writer = self.writer.lock().expect("search writer mutex");
         writer.delete_all_documents()?;
 
@@ -271,7 +299,7 @@ impl SearchIndex {
                 if !file_path.is_file() {
                     continue;
                 }
-                if let Some(id) = id_from_abs_path(notes_folder, file_path) {
+                if let Some(id) = id_from_abs_path(notes_folder, file_path, extensions) {
                     if let Ok(content) = std::fs::read_to_string(file_path) {
                         let modified = entry
                             .metadata()
@@ -554,9 +582,9 @@ fn is_visible_notes_entry(entry: &walkdir::DirEntry) -> bool {
     true
 }
 
-/// Convert an absolute file path to a note ID (relative path from notes root, no .md extension, POSIX separators).
-/// Returns None if the path is outside the root, not a .md file, or in an excluded directory.
-fn id_from_abs_path(notes_root: &Path, file_path: &Path) -> Option<String> {
+/// Convert an absolute file path to a note ID (relative path from notes root, no extension, POSIX separators).
+/// Returns None if the path is outside the root, not a valid file type, or in an excluded directory.
+fn id_from_abs_path(notes_root: &Path, file_path: &Path, extensions: &[String]) -> Option<String> {
     let rel = file_path.strip_prefix(notes_root).ok()?;
 
     // Skip excluded directories (dot-dirs catch .scratch, .git, etc.)
@@ -569,16 +597,14 @@ fn id_from_abs_path(notes_root: &Path, file_path: &Path) -> Option<String> {
         }
     }
 
-    // Must be a .md file
-    if file_path.extension()?.to_str()? != "md" {
+    let ext = file_path.extension()?.to_str()?;
+    if !extensions.iter().any(|e| e == ext) {
         return None;
     }
 
-    // Build ID: relative path without .md suffix, using POSIX separators.
-    // Strip .md by converting to string and trimming (avoids with_extension
-    // which breaks on stems containing dots like "meeting.2024-01-15.md").
     let rel_str = rel.to_str()?;
-    let id = rel_str.strip_suffix(".md")?.replace(std::path::MAIN_SEPARATOR, "/");
+    let suffix = format!(".{}", ext);
+    let id = rel_str.strip_suffix(&suffix)?.replace(std::path::MAIN_SEPARATOR, "/");
 
     if id.is_empty() {
         None
@@ -588,7 +614,9 @@ fn id_from_abs_path(notes_root: &Path, file_path: &Path) -> Option<String> {
 }
 
 /// Convert a note ID to an absolute file path. Validates against path traversal.
-fn abs_path_from_id(notes_root: &Path, id: &str) -> Result<PathBuf, String> {
+/// Tries each extension in order, returning the first existing file.
+/// Falls back to the first extension for new files.
+fn abs_path_from_id(notes_root: &Path, id: &str, extensions: &[String]) -> Result<PathBuf, String> {
     if id.contains('\\') {
         return Err("Invalid note ID: backslashes not allowed".to_string());
     }
@@ -610,11 +638,20 @@ fn abs_path_from_id(notes_root: &Path, id: &str) -> Result<PathBuf, String> {
         }
     }
 
-    // Append ".md" via OsString to avoid with_extension replacing dots in stems
-    // (e.g. "meeting.2024-01-15" would become "meeting.md" with with_extension)
     let joined = notes_root.join(rel);
+
+    for ext in extensions {
+        let mut path_os = joined.clone().into_os_string();
+        path_os.push(format!(".{}", ext));
+        let path = PathBuf::from(path_os);
+        if path.exists() && path.starts_with(notes_root) {
+            return Ok(path);
+        }
+    }
+
+    let default_ext = extensions.first().map(|s| s.as_str()).unwrap_or("md");
     let mut file_path_os = joined.into_os_string();
-    file_path_os.push(".md");
+    file_path_os.push(format!(".{}", default_ext));
     let file_path = PathBuf::from(file_path_os);
 
     if !file_path.starts_with(notes_root) {
@@ -717,67 +754,97 @@ fn normalize_notes_folder_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(trimmed))
 }
 
+/// Get the active pad's folder path from state.
+fn get_active_folder(state: &AppState) -> Result<String, String> {
+    let config = state.app_config.read().expect("app_config read lock");
+    let active_id = config.active_pad_id.as_ref().ok_or("No active pad")?;
+    config
+        .pads
+        .iter()
+        .find(|p| &p.id == active_id)
+        .map(|p| p.path.clone())
+        .ok_or_else(|| "Active pad not found".to_string())
+}
+
+/// Get the active pad's file extensions from state (defaults to ["md"]).
+fn get_active_extensions(state: &AppState) -> Vec<String> {
+    let config = state.app_config.read().expect("app_config read lock");
+    config
+        .active_pad_id
+        .as_ref()
+        .and_then(|id| config.pads.iter().find(|p| &p.id == id))
+        .map(|p| {
+            if p.file_extensions.is_empty() {
+                default_file_extensions()
+            } else {
+                p.file_extensions.clone()
+            }
+        })
+        .unwrap_or_else(default_file_extensions)
+}
+
 // TAURI COMMANDS
 
 #[tauri::command]
 fn get_notes_folder(state: State<AppState>) -> Option<String> {
-    state
-        .app_config
-        .read()
-        .expect("app_config read lock")
-        .notes_folder
-        .clone()
+    get_active_folder(&state).ok()
 }
 
-#[tauri::command]
-fn set_notes_folder(app: AppHandle, path: String, state: State<AppState>) -> Result<(), String> {
-    let path_buf = normalize_notes_folder_path(&path)?;
-    let normalized_path = path_buf.to_string_lossy().into_owned();
-
-    // Verify it's a valid directory
+/// Prepare a folder for use as a pad (create dirs, verify write access).
+fn prepare_pad_folder(path_buf: &Path) -> Result<(), String> {
     if !path_buf.exists() {
-        std::fs::create_dir_all(&path_buf).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(path_buf).map_err(|e| e.to_string())?;
     }
 
-    // Create assets folder
     let assets = path_buf.join("assets");
     std::fs::create_dir_all(&assets).map_err(|e| e.to_string())?;
 
-    // Create .scratch config folder
     let scratch_dir = path_buf.join(".scratch");
     std::fs::create_dir_all(&scratch_dir).map_err(|e| e.to_string())?;
 
-    // Verify write access early to avoid later silent failures
     let write_test_path = scratch_dir.join(".write-test");
     std::fs::write(&write_test_path, b"ok")
         .map_err(|e| format!("Notes folder is not writable: {}", e))?;
     let _ = std::fs::remove_file(&write_test_path);
 
-    // Load per-folder settings (starts fresh with defaults if none exist)
-    let settings = load_settings(&normalized_path);
+    Ok(())
+}
 
-    // Update app config
-    {
-        let mut app_config = state.app_config.write().expect("app_config write lock");
-        app_config.notes_folder = Some(normalized_path.clone());
-    }
+/// Activate a pad by ID: load settings, rebuild search index, stop old watcher.
+fn activate_pad(
+    app: &AppHandle,
+    state: &AppState,
+    pad: &PadConfig,
+) -> Result<(), String> {
+    let path_buf = PathBuf::from(&pad.path);
 
-    // Update settings in memory
+    let settings = load_settings(&pad.path);
     {
         let mut current_settings = state.settings.write().expect("settings write lock");
         *current_settings = settings;
     }
 
-    // Save app config to disk
+    // Stop existing file watcher
     {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        save_app_config(&app, &app_config).map_err(|e| e.to_string())?;
+        let mut file_watcher = state.file_watcher.lock().expect("file watcher mutex");
+        *file_watcher = None;
     }
 
-    // Initialize search index
-    if let Ok(index_path) = get_search_index_path(&app) {
+    // Clear notes cache
+    {
+        let mut cache = state.notes_cache.write().expect("cache write lock");
+        cache.clear();
+    }
+
+    let extensions = if pad.file_extensions.is_empty() {
+        default_file_extensions()
+    } else {
+        pad.file_extensions.clone()
+    };
+
+    if let Ok(index_path) = get_search_index_path(app) {
         if let Ok(search_index) = SearchIndex::new(&index_path) {
-            let _ = search_index.rebuild_index(&path_buf);
+            let _ = search_index.rebuild_index(&path_buf, &extensions);
             let mut index = state.search_index.lock().expect("search index mutex");
             *index = Some(search_index);
         }
@@ -787,14 +854,46 @@ fn set_notes_folder(app: AppHandle, path: String, state: State<AppState>) -> Res
 }
 
 #[tauri::command]
-async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
+fn set_notes_folder(app: AppHandle, path: String, state: State<AppState>) -> Result<(), String> {
+    let path_buf = normalize_notes_folder_path(&path)?;
+    let normalized_path = path_buf.to_string_lossy().into_owned();
+
+    prepare_pad_folder(&path_buf)?;
+
+    let name = path_buf
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Notes".to_string());
+
+    let pad_id = uuid::Uuid::new_v4().to_string();
+    let pad = PadConfig {
+        id: pad_id.clone(),
+        name,
+        path: normalized_path,
+        file_extensions: default_file_extensions(),
     };
+
+    {
+        let mut app_config = state.app_config.write().expect("app_config write lock");
+        app_config.pads.push(pad.clone());
+        app_config.active_pad_id = Some(pad_id);
+        app_config.notes_folder = None;
+    }
+
+    {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        save_app_config(&app, &app_config).map_err(|e| e.to_string())?;
+    }
+
+    activate_pad(&app, &state, &pad)?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, String> {
+    let folder = get_active_folder(&state)?;
+    let extensions = get_active_extensions(&state);
 
     let path = PathBuf::from(&folder);
     if !path.exists() {
@@ -815,7 +914,7 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
             if !file_path.is_file() {
                 continue;
             }
-            if let Some(id) = id_from_abs_path(&path_clone, file_path) {
+            if let Some(id) = id_from_abs_path(&path_clone, file_path, &extensions) {
                 if let Ok(content) = std::fs::read_to_string(file_path) {
                     let modified = entry
                         .metadata()
@@ -881,16 +980,11 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
 
 #[tauri::command]
 async fn read_note(id: String, state: State<'_, AppState>) -> Result<Note, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
+    let extensions = get_active_extensions(&state);
 
     let folder_path = PathBuf::from(&folder);
-    let file_path = abs_path_from_id(&folder_path, &id)?;
+    let file_path = abs_path_from_id(&folder_path, &id, &extensions)?;
     if !file_path.exists() {
         return Err("Note not found".to_string());
     }
@@ -924,13 +1018,8 @@ async fn save_note(
     content: String,
     state: State<'_, AppState>,
 ) -> Result<Note, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
+    let extensions = get_active_extensions(&state);
     let folder_path = PathBuf::from(&folder);
 
     let title = extract_title(&content);
@@ -946,14 +1035,14 @@ async fn save_note(
             (None, sanitized_leaf.clone())
         };
 
-        let old_file_path = abs_path_from_id(&folder_path, &existing_id)?;
+        let old_file_path = abs_path_from_id(&folder_path, &existing_id, &extensions)?;
 
         if existing_id != desired_id {
             let mut new_id = desired_id.clone();
             let mut counter = 1;
 
             while new_id != existing_id
-                && abs_path_from_id(&folder_path, &new_id)
+                && abs_path_from_id(&folder_path, &new_id, &extensions)
                     .map(|p| p.exists())
                     .unwrap_or(false)
             {
@@ -965,7 +1054,7 @@ async fn save_note(
                 counter += 1;
             }
 
-            let new_file_path = abs_path_from_id(&folder_path, &new_id)?;
+            let new_file_path = abs_path_from_id(&folder_path, &new_id, &extensions)?;
             (new_id, new_file_path, Some((existing_id, old_file_path)))
         } else {
             (existing_id, old_file_path, None)
@@ -975,7 +1064,7 @@ async fn save_note(
         let mut new_id = sanitized_leaf.clone();
         let mut counter = 1;
 
-        while abs_path_from_id(&folder_path, &new_id)
+        while abs_path_from_id(&folder_path, &new_id, &extensions)
             .map(|p| p.exists())
             .unwrap_or(false)
         {
@@ -983,7 +1072,7 @@ async fn save_note(
             counter += 1;
         }
 
-        let new_file_path = abs_path_from_id(&folder_path, &new_id)?;
+        let new_file_path = abs_path_from_id(&folder_path, &new_id, &extensions)?;
         (new_id, new_file_path, None)
     };
 
@@ -1037,16 +1126,11 @@ async fn save_note(
 
 #[tauri::command]
 async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
+    let extensions = get_active_extensions(&state);
 
     let folder_path = PathBuf::from(&folder);
-    let file_path = abs_path_from_id(&folder_path, &id)?;
+    let file_path = abs_path_from_id(&folder_path, &id, &extensions)?;
     if file_path.exists() {
         fs::remove_file(&file_path)
             .await
@@ -1072,13 +1156,8 @@ async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), Strin
 
 #[tauri::command]
 async fn create_note(state: State<'_, AppState>) -> Result<Note, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
+    let extensions = get_active_extensions(&state);
     let folder_path = PathBuf::from(&folder);
 
     // Get template from settings (default "Untitled")
@@ -1108,7 +1187,7 @@ async fn create_note(state: State<'_, AppState>) -> Result<Note, String> {
     let mut counter = if has_counter { 2 } else { 1 };
 
     // Ensure filename uniqueness
-    while abs_path_from_id(&folder_path, &final_id)
+    while abs_path_from_id(&folder_path, &final_id, &extensions)
         .map(|p| p.exists())
         .unwrap_or(false)
     {
@@ -1124,7 +1203,7 @@ async fn create_note(state: State<'_, AppState>) -> Result<Note, String> {
     let display_title = extract_title_from_id(&final_id);
 
     let content = format!("# {}\n\n", display_title);
-    let file_path = abs_path_from_id(&folder_path, &final_id)?;
+    let file_path = abs_path_from_id(&folder_path, &final_id, &extensions)?;
 
     // Create parent directories (for templates like {year}/{month}/{day})
     if let Some(parent) = file_path.parent() {
@@ -1169,10 +1248,7 @@ fn update_settings(
     new_settings: Settings,
     state: State<AppState>,
 ) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
 
     {
         let mut settings = state.settings.write().expect("settings write lock");
@@ -1334,15 +1410,11 @@ async fn search_notes(query: String, state: State<'_, AppState>) -> Result<Vec<S
 
 // Fallback search when Tantivy index isn't available - searches title and full content
 async fn fallback_search(query: &str, state: &State<'_, AppState>) -> Result<Vec<SearchResult>, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
+    let folder = match get_active_folder(state) {
+        Ok(f) => f,
+        Err(_) => return Ok(vec![]),
     };
-
-    let folder = match folder {
-        Some(f) => f,
-        None => return Ok(vec![]),
-    };
+    let extensions = get_active_extensions(state);
 
     // Collect cache data upfront to avoid holding lock during async operations
     let cache_data: Vec<(String, String, String, i64)> = {
@@ -1373,7 +1445,7 @@ async fn fallback_search(query: &str, state: &State<'_, AppState>) -> Result<Vec
         }
 
         // Read file content asynchronously and search in it
-        let file_path = match abs_path_from_id(&folder_path, &id) {
+        let file_path = match abs_path_from_id(&folder_path, &id, &extensions) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -1418,6 +1490,7 @@ fn setup_file_watcher(
     app: AppHandle,
     notes_folder: &str,
     debounce_map: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    extensions: Vec<String>,
 ) -> Result<FileWatcherState, String> {
     let folder_path = PathBuf::from(notes_folder);
     let notes_root = folder_path.clone();
@@ -1427,7 +1500,7 @@ fn setup_file_watcher(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 for path in event.paths.iter() {
-                    let note_id = match id_from_abs_path(&notes_root, path) {
+                    let note_id = match id_from_abs_path(&notes_root, path, &extensions) {
                         Some(id) => id,
                         None => continue,
                     };
@@ -1526,21 +1599,16 @@ fn setup_file_watcher(
 
 #[tauri::command]
 fn start_file_watcher(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
+    let extensions = get_active_extensions(&state);
 
-    // Clean up debounce map before starting
     cleanup_debounce_map(&state.debounce_map);
 
     let watcher_state = setup_file_watcher(
         app,
         &folder,
         Arc::clone(&state.debounce_map),
+        extensions,
     )?;
 
     let mut file_watcher = state.file_watcher.lock().expect("file watcher mutex");
@@ -1559,18 +1627,11 @@ async fn save_clipboard_image(
     base64_data: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    // Guard against empty clipboard payload
     if base64_data.trim().is_empty() {
         return Err("Clipboard data is empty".to_string());
     }
 
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
 
     // Decode base64
     let image_data = base64::engine::general_purpose::STANDARD
@@ -1618,13 +1679,7 @@ async fn copy_image_to_assets(
     source_path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
 
     let source = PathBuf::from(&source_path);
     if !source.exists() {
@@ -1674,20 +1729,14 @@ async fn copy_image_to_assets(
 
 #[tauri::command]
 fn rebuild_search_index(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
+    let extensions = get_active_extensions(&state);
 
     let index_path = get_search_index_path(&app).map_err(|e| e.to_string())?;
 
-    // Create new index
     let search_index = SearchIndex::new(&index_path).map_err(|e| e.to_string())?;
     search_index
-        .rebuild_index(&PathBuf::from(&folder))
+        .rebuild_index(&PathBuf::from(&folder), &extensions)
         .map_err(|e| e.to_string())?;
 
     let mut index = state.search_index.lock().expect("search index mutex");
@@ -1780,6 +1829,186 @@ async fn open_url_safe(url: String) -> Result<(), String> {
     open::that(&url).map_err(|e| format!("Failed to open URL: {}", e))
 }
 
+// Pad management commands
+
+#[tauri::command]
+fn list_pads(state: State<AppState>) -> PadsInfo {
+    let config = state.app_config.read().expect("app_config read lock");
+    PadsInfo {
+        pads: config.pads.clone(),
+        active_pad_id: config.active_pad_id.clone(),
+    }
+}
+
+#[tauri::command]
+fn add_pad(
+    app: AppHandle,
+    name: String,
+    path: String,
+    file_extensions: Option<Vec<String>>,
+    state: State<AppState>,
+) -> Result<PadConfig, String> {
+    let path_buf = normalize_notes_folder_path(&path)?;
+    let normalized_path = path_buf.to_string_lossy().into_owned();
+
+    prepare_pad_folder(&path_buf)?;
+
+    let extensions = file_extensions.unwrap_or_else(default_file_extensions);
+
+    let pad = PadConfig {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        path: normalized_path,
+        file_extensions: extensions,
+    };
+
+    let is_first_pad;
+    {
+        let mut config = state.app_config.write().expect("app_config write lock");
+        is_first_pad = config.pads.is_empty();
+        config.pads.push(pad.clone());
+        if is_first_pad {
+            config.active_pad_id = Some(pad.id.clone());
+        }
+    }
+
+    {
+        let config = state.app_config.read().expect("app_config read lock");
+        save_app_config(&app, &config).map_err(|e| e.to_string())?;
+    }
+
+    if is_first_pad {
+        activate_pad(&app, &state, &pad)?;
+    }
+
+    Ok(pad)
+}
+
+#[tauri::command]
+fn remove_pad(
+    app: AppHandle,
+    pad_id: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let need_switch;
+    {
+        let mut config = state.app_config.write().expect("app_config write lock");
+        config.pads.retain(|p| p.id != pad_id);
+        need_switch = config.active_pad_id.as_ref() == Some(&pad_id);
+        if need_switch {
+            config.active_pad_id = config.pads.first().map(|p| p.id.clone());
+        }
+    }
+
+    {
+        let config = state.app_config.read().expect("app_config read lock");
+        save_app_config(&app, &config).map_err(|e| e.to_string())?;
+    }
+
+    if need_switch {
+        let new_active = {
+            let config = state.app_config.read().expect("app_config read lock");
+            config
+                .active_pad_id
+                .as_ref()
+                .and_then(|id| config.pads.iter().find(|p| &p.id == id))
+                .cloned()
+        };
+
+        if let Some(pad) = new_active {
+            activate_pad(&app, &state, &pad)?;
+        } else {
+            // No pads left -- clear state
+            {
+                let mut settings = state.settings.write().expect("settings write lock");
+                *settings = Settings::default();
+            }
+            {
+                let mut watcher = state.file_watcher.lock().expect("file watcher mutex");
+                *watcher = None;
+            }
+            {
+                let mut cache = state.notes_cache.write().expect("cache write lock");
+                cache.clear();
+            }
+            {
+                let mut index = state.search_index.lock().expect("search index mutex");
+                *index = None;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn switch_pad(
+    app: AppHandle,
+    pad_id: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let pad = {
+        let mut config = state.app_config.write().expect("app_config write lock");
+        let pad = config
+            .pads
+            .iter()
+            .find(|p| p.id == pad_id)
+            .cloned()
+            .ok_or("Pad not found")?;
+        config.active_pad_id = Some(pad_id);
+        pad
+    };
+
+    {
+        let config = state.app_config.read().expect("app_config read lock");
+        save_app_config(&app, &config).map_err(|e| e.to_string())?;
+    }
+
+    activate_pad(&app, &state, &pad)?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn update_pad(
+    app: AppHandle,
+    pad_id: String,
+    name: Option<String>,
+    file_extensions: Option<Vec<String>>,
+    state: State<AppState>,
+) -> Result<PadConfig, String> {
+    let (updated_pad, is_active) = {
+        let mut config = state.app_config.write().expect("app_config write lock");
+        let pad_idx = config
+            .pads
+            .iter()
+            .position(|p| p.id == pad_id)
+            .ok_or("Pad not found")?;
+
+        if let Some(n) = name {
+            config.pads[pad_idx].name = n;
+        }
+        if let Some(exts) = file_extensions {
+            config.pads[pad_idx].file_extensions = exts;
+        }
+
+        let is_active = config.active_pad_id.as_ref() == Some(&pad_id);
+        (config.pads[pad_idx].clone(), is_active)
+    };
+
+    {
+        let config = state.app_config.read().expect("app_config read lock");
+        save_app_config(&app, &config).map_err(|e| e.to_string())?;
+    }
+
+    // If the active pad's extensions changed, rebuild its search index
+    if is_active {
+        activate_pad(&app, &state, &updated_pad)?;
+    }
+
+    Ok(updated_pad)
+}
+
 // Git commands - run blocking git operations off the main thread
 
 #[tauri::command]
@@ -1791,10 +2020,7 @@ async fn git_is_available() -> bool {
 
 #[tauri::command]
 async fn git_get_status(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+    let folder = get_active_folder(&state).ok();
 
     match folder {
         Some(path) => {
@@ -1810,10 +2036,7 @@ async fn git_get_status(state: State<'_, AppState>) -> Result<git::GitStatus, St
 
 #[tauri::command]
 async fn git_init_repo(state: State<'_, AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
-    };
+    let folder = get_active_folder(&state)?;
 
     tauri::async_runtime::spawn_blocking(move || {
         git::git_init(&PathBuf::from(folder))
@@ -1824,10 +2047,7 @@ async fn git_init_repo(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn git_commit(message: String, state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+    let folder = get_active_folder(&state).ok();
 
     match folder {
         Some(path) => {
@@ -1847,10 +2067,7 @@ async fn git_commit(message: String, state: State<'_, AppState>) -> Result<git::
 
 #[tauri::command]
 async fn git_push(state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+    let folder = get_active_folder(&state).ok();
 
     match folder {
         Some(path) => {
@@ -1870,10 +2087,7 @@ async fn git_push(state: State<'_, AppState>) -> Result<git::GitResult, String> 
 
 #[tauri::command]
 async fn git_add_remote(url: String, state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+    let folder = get_active_folder(&state).ok();
 
     match folder {
         Some(path) => {
@@ -1893,10 +2107,7 @@ async fn git_add_remote(url: String, state: State<'_, AppState>) -> Result<git::
 
 #[tauri::command]
 async fn git_push_with_upstream(state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+    let folder = get_active_folder(&state).ok();
 
     match folder {
         Some(path) => {
@@ -2251,17 +2462,11 @@ fn try_select_in_notes_folder(app: &AppHandle, path: &Path) -> bool {
         None => return false,
     };
 
-    let notes_folder = state
-        .app_config
-        .read()
-        .expect("app_config read lock")
-        .notes_folder
-        .clone();
-
-    let folder = match notes_folder {
-        Some(f) => f,
-        None => return false,
+    let folder = match get_active_folder(&state) {
+        Ok(f) => f,
+        Err(_) => return false,
     };
+    let extensions = get_active_extensions(&state);
 
     let folder_path = PathBuf::from(&folder);
     let (canonical_file, canonical_folder) = match (path.canonicalize(), folder_path.canonicalize())
@@ -2274,7 +2479,7 @@ fn try_select_in_notes_folder(app: &AppHandle, path: &Path) -> bool {
         return false;
     }
 
-    let note_id = match id_from_abs_path(&canonical_folder, &canonical_file) {
+    let note_id = match id_from_abs_path(&canonical_folder, &canonical_file, &extensions) {
         Some(id) => id,
         None => return false,
     };
@@ -2407,50 +2612,70 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            // Load app config on startup (contains notes folder path)
             let mut app_config = load_app_config(app.handle());
 
-            // Normalize legacy/invalid saved paths (e.g. file:// URI from older builds)
-            if let Some(saved_path) = app_config.notes_folder.clone() {
-                match normalize_notes_folder_path(&saved_path) {
-                    Ok(normalized) if normalized.is_dir() => {
+            // Migrate legacy single-folder config to pads format
+            if let Some(legacy_folder) = app_config.notes_folder.take() {
+                if app_config.pads.is_empty() {
+                    if let Ok(normalized) = normalize_notes_folder_path(&legacy_folder) {
                         let normalized_str = normalized.to_string_lossy().into_owned();
-                        if normalized_str != saved_path {
-                            app_config.notes_folder = Some(normalized_str);
-                            let _ = save_app_config(app.handle(), &app_config);
-                        }
+                        let name = normalized
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Notes".to_string());
+                        let pad_id = uuid::Uuid::new_v4().to_string();
+                        app_config.pads.push(PadConfig {
+                            id: pad_id.clone(),
+                            name,
+                            path: normalized_str,
+                            file_extensions: default_file_extensions(),
+                        });
+                        app_config.active_pad_id = Some(pad_id);
                     }
-                    Ok(normalized) => {
-                        // Path is structurally valid but not currently a directory
-                        // (e.g., unmounted drive). Preserve the user's preference.
-                        eprintln!("Notes folder not found (may be temporarily unavailable): {:?}", normalized);
-                    }
-                    Err(_) => {
-                        app_config.notes_folder = None;
-                        let _ = save_app_config(app.handle(), &app_config);
+                    let _ = save_app_config(app.handle(), &app_config);
+                }
+            }
+
+            // Normalize pad paths
+            for pad in &mut app_config.pads {
+                if let Ok(normalized) = normalize_notes_folder_path(&pad.path) {
+                    let normalized_str = normalized.to_string_lossy().into_owned();
+                    if normalized_str != pad.path {
+                        pad.path = normalized_str;
                     }
                 }
             }
 
-            // Load per-folder settings if notes folder is set
-            let settings = if let Some(ref folder) = app_config.notes_folder {
-                load_settings(folder)
-            } else {
-                Settings::default()
-            };
+            // Resolve active pad
+            let active_pad = app_config
+                .active_pad_id
+                .as_ref()
+                .and_then(|id| app_config.pads.iter().find(|p| &p.id == id))
+                .cloned();
 
-            // Initialize search index if notes folder is set
-            let search_index = if let Some(ref folder) = app_config.notes_folder {
-                if let Ok(index_path) = get_search_index_path(app.handle()) {
+            let settings = active_pad
+                .as_ref()
+                .map(|p| load_settings(&p.path))
+                .unwrap_or_default();
+
+            let extensions = active_pad
+                .as_ref()
+                .map(|p| {
+                    if p.file_extensions.is_empty() {
+                        default_file_extensions()
+                    } else {
+                        p.file_extensions.clone()
+                    }
+                })
+                .unwrap_or_else(default_file_extensions);
+
+            let search_index = active_pad.as_ref().and_then(|pad| {
+                get_search_index_path(app.handle()).ok().and_then(|index_path| {
                     SearchIndex::new(&index_path).ok().inspect(|idx| {
-                        let _ = idx.rebuild_index(&PathBuf::from(folder));
+                        let _ = idx.rebuild_index(&PathBuf::from(&pad.path), &extensions);
                     })
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+                })
+            });
 
             let state = AppState {
                 app_config: RwLock::new(app_config),
@@ -2491,6 +2716,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_notes_folder,
             set_notes_folder,
+            list_pads,
+            add_pad,
+            remove_pad,
+            switch_pad,
+            update_pad,
             list_notes,
             read_note,
             save_note,

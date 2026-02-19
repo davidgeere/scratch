@@ -7,7 +7,8 @@
 /* Theme color tokens - Light mode (default) */
 :root {
   --color-bg: #ffffff;
-  --color-bg-secondary: #fafaf9;
+  --color-bg-secondary: #f0efed;
+  --color-bg-tertiary: #e4e3e0;
   --color-bg-muted: rgba(28, 25, 23, 0.06);
   --color-bg-emphasis: rgba(28, 25, 23, 0.09);
   --color-text: #1c1917;
@@ -40,6 +41,7 @@
 .dark {
   --color-bg: rgb(22, 20, 19);
   --color-bg-secondary: rgb(14, 12, 11);
+  --color-bg-tertiary: rgb(8, 6, 5);
   --color-bg-muted: rgba(250, 249, 249, 0.05);
   --color-bg-emphasis: rgba(250, 249, 249, 0.08);
   --color-text: #fafaf9;
@@ -72,6 +74,7 @@
   /* Background colors */
   --color-bg: var(--color-bg);
   --color-bg-secondary: var(--color-bg-secondary);
+  --color-bg-tertiary: var(--color-bg-tertiary);
   --color-bg-muted: var(--color-bg-muted);
   --color-bg-emphasis: var(--color-bg-emphasis);
 
@@ -207,6 +210,19 @@ html.dark {
 
 .animate-fade-in {
   animation: fade-in 0.15s ease-out;
+}
+
+@keyframes content-crossfade {
+  from {
+    opacity: 0.4;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-content-crossfade {
+  animation: content-crossfade 250ms ease-out;
 }
 
 .animate-slide-down {

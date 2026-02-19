@@ -1,18 +1,23 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { useNotes } from "../../context/NotesContext";
+import { usePads } from "../../context/PadsContext";
 import { useTheme } from "../../context/ThemeContext";
 import { useGit } from "../../context/GitContext";
 import { Button } from "../ui";
 import { Input } from "../ui";
 import {
   FolderIcon,
-  FoldersIcon,
   ExternalLinkIcon,
   SpinnerIcon,
   CloudPlusIcon,
   ChevronRightIcon,
+  XIcon,
+  PlusIcon,
+  CheckIcon,
+  TrashIcon,
 } from "../icons";
 import type { Settings } from "../../types/note";
 
@@ -44,7 +49,8 @@ function getRemoteWebUrl(url: string | null): string | null {
 }
 
 export function GeneralSettingsSection() {
-  const { notesFolder, setNotesFolder } = useNotes();
+  const { notesFolder } = useNotes();
+  const { pads, activePad, activePadId, switchPad, addPad, removePad, updatePad } = usePads();
   const { reloadSettings } = useTheme();
   const {
     status,
@@ -63,6 +69,7 @@ export function GeneralSettingsSection() {
   const [showRemoteInput, setShowRemoteInput] = useState(false);
   const [noteTemplate, setNoteTemplate] = useState<string>("Untitled");
   const [previewNoteName, setPreviewNoteName] = useState<string>("Untitled");
+  const [newExtension, setNewExtension] = useState("");
 
   // Load template from settings on mount
   useEffect(() => {
@@ -115,22 +122,68 @@ export function GeneralSettingsSection() {
     }
   };
 
-  const handleChangeFolder = async () => {
-    try {
-      const selected = await invoke<string | null>("open_folder_dialog", {
-        defaultPath: notesFolder || null,
-      });
+  const handleAddExtension = useCallback(async () => {
+    if (!activePad) return;
+    const ext = newExtension.trim().replace(/^\./, "");
+    if (!ext) return;
+    if (activePad.fileExtensions.includes(ext)) {
+      toast.error(`Extension .${ext} already added`);
+      return;
+    }
+    await updatePad(activePad.id, undefined, [...activePad.fileExtensions, ext]);
+    setNewExtension("");
+    toast.success(`Extension .${ext} added — notes will reload`);
+  }, [activePad, newExtension, updatePad]);
 
-      if (selected) {
-        await setNotesFolder(selected);
-        // Reload theme/font settings from the new folder's .scratch/settings.json
+  const handleRemoveExtension = useCallback(
+    async (ext: string) => {
+      if (!activePad) return;
+      const remaining = activePad.fileExtensions.filter((e) => e !== ext);
+      if (remaining.length === 0) {
+        toast.error("Must have at least one file extension");
+        return;
+      }
+      await updatePad(activePad.id, undefined, remaining);
+      toast.success(`Extension .${ext} removed — notes will reload`);
+    },
+    [activePad, updatePad],
+  );
+
+  const handleAddPad = useCallback(async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose Folder for New Pad",
+      });
+      if (selected && typeof selected === "string") {
+        const name = selected.split("/").filter(Boolean).pop() || "Notes";
+        await addPad(name, selected);
         await reloadSettings();
+        toast.success(`Pad "${name}" added`);
       }
     } catch (err) {
-      console.error("Failed to select folder:", err);
-      toast.error("Failed to select folder");
+      console.error("Failed to add pad:", err);
+      toast.error("Failed to add pad");
     }
-  };
+  }, [addPad, reloadSettings]);
+
+  const handleSwitchPad = useCallback(
+    async (padId: string) => {
+      if (padId === activePadId) return;
+      await switchPad(padId);
+      await reloadSettings();
+    },
+    [activePadId, switchPad, reloadSettings],
+  );
+
+  const handleRemovePad = useCallback(
+    async (padId: string, padName: string) => {
+      await removePad(padId);
+      toast.success(`Pad "${padName}" removed`);
+    },
+    [removePad],
+  );
 
   const handleOpenFolder = async () => {
     if (!notesFolder) return;
@@ -186,9 +239,77 @@ export function GeneralSettingsSection() {
 
   return (
     <div className="space-y-8 py-8">
-      {/* Folder Location */}
+      {/* Pads Management */}
       <section className="pb-2">
-        <h2 className="text-xl font-medium mb-0.5">Folder Location</h2>
+        <h2 className="text-xl font-medium mb-0.5">Pads</h2>
+        <p className="text-sm text-text-muted mb-4">
+          Each pad connects to a folder on your computer. Switch between pads to
+          work with different sets of notes.
+        </p>
+        <div className="space-y-1.5 mb-3">
+          {pads.map((pad) => (
+            <div
+              key={pad.id}
+              className={`flex items-center gap-2.5 p-2.5 rounded-[10px] border transition-colors ${
+                pad.id === activePadId
+                  ? "border-text/20 bg-bg-muted/50"
+                  : "border-border hover:border-text/10 cursor-pointer"
+              }`}
+              onClick={() => handleSwitchPad(pad.id)}
+            >
+              <div className="p-2 rounded-md bg-bg-muted">
+                <FolderIcon className="w-4.5 h-4.5 stroke-[1.5] text-text-muted" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-sm font-medium truncate">
+                    {pad.name}
+                  </span>
+                  {pad.id === activePadId && (
+                    <CheckIcon className="w-3.5 h-3.5 stroke-[2] shrink-0 text-text-muted" />
+                  )}
+                </div>
+                <p
+                  className="text-xs text-text-muted truncate"
+                  title={pad.path}
+                >
+                  {formatPath(pad.path)}
+                </p>
+              </div>
+              {pads.length > 1 && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleRemovePad(pad.id, pad.name);
+                  }}
+                  className="p-1.5 rounded-md text-text-muted/50 hover:text-red-500 hover:bg-red-500/10 transition-colors shrink-0"
+                  title="Remove pad"
+                >
+                  <TrashIcon className="w-3.5 h-3.5 stroke-[1.5]" />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+        <Button
+          onClick={handleAddPad}
+          variant="outline"
+          size="md"
+          className="gap-1.25"
+        >
+          <PlusIcon className="w-3.5 h-3.5 stroke-[1.5]" />
+          Add Pad
+        </Button>
+      </section>
+
+      {/* Divider */}
+      <div className="border-t border-border border-dashed" />
+
+      {/* Active Pad Folder */}
+      <section className="pb-2">
+        <h2 className="text-xl font-medium mb-0.5">
+          {activePad ? activePad.name : "Folder Location"}
+        </h2>
         <p className="text-sm text-text-muted mb-4">
           Your notes are stored as markdown files in this folder
         </p>
@@ -204,21 +325,12 @@ export function GeneralSettingsSection() {
           </p>
         </div>
         <div className="flex items-center gap-1">
-          <Button
-            onClick={handleChangeFolder}
-            variant="outline"
-            size="md"
-            className="gap-1.25"
-          >
-            <FoldersIcon className="w-4.5 h-4.5 stroke-[1.5]" />
-            Change Folder
-          </Button>
           {notesFolder && (
             <Button
               onClick={handleOpenFolder}
-              variant="ghost"
+              variant="outline"
               size="md"
-              className="gap-1.25 text-text"
+              className="gap-1.25"
             >
               Open Folder
             </Button>
@@ -228,6 +340,60 @@ export function GeneralSettingsSection() {
 
       {/* Divider */}
       <div className="border-t border-border border-dashed" />
+
+      {/* File Extensions */}
+      {activePad && (
+        <>
+          <section className="pb-2">
+            <h2 className="text-xl font-medium mb-0.5">File Extensions</h2>
+            <p className="text-sm text-text-muted mb-4">
+              Which file types to include in this pad
+            </p>
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              {activePad.fileExtensions.map((ext) => (
+                <span
+                  key={ext}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-bg-muted text-sm font-mono"
+                >
+                  .{ext}
+                  {activePad.fileExtensions.length > 1 && (
+                    <button
+                      onClick={() => handleRemoveExtension(ext)}
+                      className="text-text-muted hover:text-text transition-colors"
+                    >
+                      <XIcon className="w-3 h-3 stroke-[2]" />
+                    </button>
+                  )}
+                </span>
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                type="text"
+                value={newExtension}
+                onChange={(e) => setNewExtension(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleAddExtension();
+                }}
+                placeholder="txt, mdx..."
+                className="max-w-40"
+              />
+              <Button
+                onClick={handleAddExtension}
+                variant="outline"
+                size="md"
+                disabled={!newExtension.trim()}
+                className="gap-1"
+              >
+                <PlusIcon className="w-3.5 h-3.5 stroke-[1.5]" />
+                Add
+              </Button>
+            </div>
+          </section>
+
+          <div className="border-t border-border border-dashed" />
+        </>
+      )}
 
       {/* Git Section */}
       <section className="pb-2">

@@ -138,7 +138,7 @@ export const Footer = memo(function Footer({ onOpenSettings }: FooterProps) {
   const showCloudCheck = status?.hasRemote && !hasChanges && !canPush;
 
   return (
-    <div className="shrink-0 border-t border-border">
+    <div className="shrink-0">
       {/* Footer bar with git status and action buttons */}
       <div className="pl-4 pr-3 pt-2 pb-2.5 flex items-center justify-between">
         {renderGitStatus()}

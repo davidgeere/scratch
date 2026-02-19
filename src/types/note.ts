@@ -1,3 +1,15 @@
+export interface PadConfig {
+  id: string;
+  name: string;
+  path: string;
+  fileExtensions: string[];
+}
+
+export interface PadsInfo {
+  pads: PadConfig[];
+  activePadId: string | null;
+}
+
 export interface NoteMetadata {
   id: string;
   title: string;

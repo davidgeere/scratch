@@ -21,7 +21,6 @@ function formatDate(timestamp: number): string {
   const date = new Date(timestamp * 1000);
   const now = new Date();
 
-  // Get start of today, yesterday, etc. (midnight local time)
   const startOfToday = new Date(
     now.getFullYear(),
     now.getMonth(),
@@ -29,31 +28,25 @@ function formatDate(timestamp: number): string {
   );
   const startOfYesterday = new Date(startOfToday.getTime() - 86400000);
 
-  // Today: show time
   if (date >= startOfToday) {
     return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }
 
-  // Yesterday
   if (date >= startOfYesterday) {
     return "Yesterday";
   }
 
-  // Calculate days ago
   const daysAgo =
     Math.floor((startOfToday.getTime() - date.getTime()) / 86400000) + 1;
 
-  // 2-6 days ago: show "X days ago"
   if (daysAgo <= 6) {
     return `${daysAgo} days ago`;
   }
 
-  // This year: show month and day
   if (date.getFullYear() === now.getFullYear()) {
     return date.toLocaleDateString([], { month: "short", day: "numeric" });
   }
 
-  // Different year: show full date
   return date.toLocaleDateString([], {
     month: "short",
     day: "numeric",
@@ -61,7 +54,6 @@ function formatDate(timestamp: number): string {
   });
 }
 
-// Memoized note item component
 interface NoteItemProps {
   id: string;
   title: string;
@@ -89,15 +81,10 @@ const NoteItem = memo(function NoteItem({
     [onContextMenu, id]
   );
 
-  const folder = id.includes('/') ? id.substring(0, id.lastIndexOf('/')) : null;
-  const displayPreview = folder
-    ? preview ? `${folder}/ · ${preview}` : `${folder}/`
-    : preview;
-
   return (
     <ListItem
       title={cleanTitle(title)}
-      subtitle={displayPreview}
+      subtitle={preview}
       meta={formatDate(modified)}
       isSelected={isSelected}
       isPinned={isPinned}
@@ -107,7 +94,11 @@ const NoteItem = memo(function NoteItem({
   );
 });
 
-export function NoteList() {
+interface NoteListProps {
+  selectedFolder?: string | null;
+}
+
+export function NoteList({ selectedFolder }: NoteListProps) {
   const {
     notes,
     selectedNoteId,
@@ -126,7 +117,6 @@ export function NoteList() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Load settings when notes change
   useEffect(() => {
     notesService
       .getSettings()
@@ -136,7 +126,6 @@ export function NoteList() {
       });
   }, [notes]);
 
-  // Calculate pinned IDs set for efficient lookup
   const pinnedIds = useMemo(
     () => new Set(settings?.pinnedNoteIds || []),
     [settings]
@@ -166,7 +155,6 @@ export function NoteList() {
             action: async () => {
               try {
                 await (isPinned ? unpinNote(noteId) : pinNote(noteId));
-                // Refresh settings after pin/unpin
                 const newSettings = await notesService.getSettings();
                 setSettings(newSettings);
               } catch (error) {
@@ -208,7 +196,6 @@ export function NoteList() {
     [pinnedIds, pinNote, unpinNote, duplicateNote]
   );
 
-  // Memoize display items to prevent recalculation on every render
   const displayItems = useMemo(() => {
     if (searchQuery.trim()) {
       return searchResults.map((r) => ({
@@ -218,10 +205,12 @@ export function NoteList() {
         modified: r.modified,
       }));
     }
+    if (selectedFolder) {
+      return notes.filter((n) => n.id.startsWith(selectedFolder + "/"));
+    }
     return notes;
-  }, [searchQuery, searchResults, notes]);
+  }, [searchQuery, searchResults, notes, selectedFolder]);
 
-  // Listen for focus request from editor (when Escape is pressed)
   useEffect(() => {
     const handleFocusNoteList = () => {
       containerRef.current?.focus();
@@ -278,7 +267,6 @@ export function NoteList() {
         ))}
       </div>
 
-      {/* Delete confirmation dialog */}
       <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>

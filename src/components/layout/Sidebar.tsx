@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNotes } from "../../context/NotesContext";
+import { usePads } from "../../context/PadsContext";
 import { NoteList } from "../notes/NoteList";
 import { Footer } from "./Footer";
 import { IconButton, Input } from "../ui";
@@ -8,21 +9,25 @@ import {
   XIcon,
   SearchIcon,
   SearchOffIcon,
+  PanelLeftIcon,
 } from "../icons";
 import { mod, shift, isMac } from "../../lib/platform";
 
 interface SidebarProps {
+  selectedFolder: string | null;
   onOpenSettings?: () => void;
+  onTogglePadNav?: () => void;
+  padNavOpen?: boolean;
 }
 
-export function Sidebar({ onOpenSettings }: SidebarProps) {
+export function Sidebar({ selectedFolder, onOpenSettings, onTogglePadNav, padNavOpen }: SidebarProps) {
   const { createNote, notes, search, searchQuery, clearSearch } = useNotes();
+  const { activePad } = usePads();
   const [searchOpen, setSearchOpen] = useState(false);
   const [inputValue, setInputValue] = useState(searchQuery);
   const debounceRef = useRef<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // Sync input with search query
   useEffect(() => {
     setInputValue(searchQuery);
   }, [searchQuery]);
@@ -31,12 +36,9 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const value = e.target.value;
       setInputValue(value);
-
-      // Debounce search
       if (debounceRef.current) {
         clearTimeout(debounceRef.current);
       }
-
       debounceRef.current = window.setTimeout(() => {
         search(value);
       }, 220);
@@ -54,25 +56,17 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     clearSearch();
   }, [clearSearch]);
 
-  // Auto-focus search input when opened
   useEffect(() => {
     if (searchOpen) {
-      // Small delay to ensure the input is rendered
-      requestAnimationFrame(() => {
-        searchInputRef.current?.focus();
-      });
+      requestAnimationFrame(() => searchInputRef.current?.focus());
     }
   }, [searchOpen]);
 
-  // Global shortcut hook: open and focus sidebar search
   useEffect(() => {
     const handleOpenSidebarSearch = () => {
       setSearchOpen(true);
-      requestAnimationFrame(() => {
-        searchInputRef.current?.focus();
-      });
+      requestAnimationFrame(() => searchInputRef.current?.focus());
     };
-
     window.addEventListener("open-sidebar-search", handleOpenSidebarSearch);
     return () =>
       window.removeEventListener("open-sidebar-search", handleOpenSidebarSearch);
@@ -83,11 +77,9 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
       if (e.key === "Escape") {
         e.preventDefault();
         if (inputValue) {
-          // First escape: clear search
           setInputValue("");
           clearSearch();
         } else {
-          // Second escape: close search
           closeSearch();
         }
       }
@@ -100,18 +92,49 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     clearSearch();
   }, [clearSearch]);
 
+  const folderDisplayName = selectedFolder
+    ? selectedFolder.split("/").pop() || selectedFolder
+    : "All Notes";
+
+  const filteredCount = useMemo(() => {
+    if (!selectedFolder) return notes.length;
+    return notes.filter((n) => n.id.startsWith(selectedFolder + "/")).length;
+  }, [notes, selectedFolder]);
+
   return (
-    <div className="w-64 h-full bg-bg-secondary border-r border-border flex flex-col select-none">
+    <div className="h-full bg-bg-secondary flex flex-col select-none">
       {/* Drag region */}
-      <div className="h-11 shrink-0" data-tauri-drag-region></div>
-      <div className="flex items-center justify-between pl-4 pr-3 pb-2 border-b border-border shrink-0">
-        <div className="flex items-center gap-1">
-          <div className="font-medium text-base">Notes</div>
-          <div className="text-text-muted font-medium text-2xs min-w-4.75 h-4.75 flex items-center justify-center px-1 bg-bg-muted rounded-sm mt-0.5 pt-px">
-            {notes.length}
+      <div className="h-11 shrink-0" data-tauri-drag-region />
+
+      {/* Header: breadcrumb + actions */}
+      <div className="flex items-center justify-between pl-3 pr-3 pb-2 shrink-0">
+        <div className="flex items-center gap-1.5 min-w-0">
+          {onTogglePadNav && (
+            <IconButton
+              onClick={onTogglePadNav}
+              title="Toggle Pads"
+              className={padNavOpen ? "text-text-muted" : ""}
+            >
+              <PanelLeftIcon className="w-4.25 h-4.25 stroke-[1.5]" />
+            </IconButton>
+          )}
+          <div className="flex flex-col min-w-0">
+            {(!padNavOpen || selectedFolder) && activePad && (
+              <span className="text-2xs font-medium uppercase tracking-wider text-text-muted truncate">
+                {activePad.name}
+              </span>
+            )}
+            <div className="flex items-center gap-1.5">
+              <span className="font-medium text-sm truncate">
+                {folderDisplayName}
+              </span>
+              <div className="text-text-muted font-medium text-2xs min-w-4.75 h-4.75 flex items-center justify-center px-1 bg-bg-muted rounded-sm pt-px shrink-0">
+                {filteredCount}
+              </div>
+            </div>
           </div>
         </div>
-        <div className="flex items-center gap-px">
+        <div className="flex items-center gap-px shrink-0">
           <IconButton
             onClick={toggleSearch}
             title={`Search Notes (${mod}${isMac ? "" : "+"}${shift}${isMac ? "" : "+"}F)`}
@@ -131,9 +154,9 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
           </IconButton>
         </div>
       </div>
-      {/* Scrollable area with search and notes */}
+
+      {/* Scrollable area: search + notes */}
       <div className="flex-1 overflow-y-auto">
-        {/* Search - sticky at top */}
         {searchOpen && (
           <div className="sticky top-0 z-10 px-2 pt-2 bg-bg-secondary">
             <div className="relative">
@@ -159,11 +182,10 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
           </div>
         )}
 
-        {/* Note list */}
-        <NoteList />
+        <NoteList selectedFolder={selectedFolder} />
       </div>
 
-      {/* Footer with git status, commit, and settings */}
+      {/* Footer */}
       <Footer onOpenSettings={onOpenSettings} />
     </div>
   );

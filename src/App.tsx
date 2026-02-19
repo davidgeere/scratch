@@ -1,9 +1,18 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { toast } from "sonner";
 import { NotesProvider, useNotes } from "./context/NotesContext";
+import { PadsProvider, usePads } from "./context/PadsContext";
 import { ThemeProvider } from "./context/ThemeContext";
 import { GitProvider } from "./context/GitContext";
 import { TooltipProvider, Toaster } from "./components/ui";
+import { PadNav } from "./components/layout/PadNav";
 import { Sidebar } from "./components/layout/Sidebar";
 import { Editor } from "./components/editor/Editor";
 import type { Editor as TiptapEditor } from "@tiptap/react";
@@ -35,11 +44,126 @@ function getWindowMode(): {
   };
 }
 
+const PAD_NAV_MIN = 200;
+const PAD_NAV_MAX = 360;
+const PAD_NAV_DEFAULT = 240;
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 400;
+const SIDEBAR_DEFAULT = 240;
+
+function loadColumnWidths(): { padNav: number; sidebar: number } {
+  try {
+    const raw = localStorage.getItem("scratch-column-widths");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        padNav: Math.max(PAD_NAV_MIN, Math.min(PAD_NAV_MAX, parsed.padNav ?? PAD_NAV_DEFAULT)),
+        sidebar: Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, parsed.sidebar ?? SIDEBAR_DEFAULT)),
+      };
+    }
+  } catch { /* */ }
+  return { padNav: PAD_NAV_DEFAULT, sidebar: SIDEBAR_DEFAULT };
+}
+
+function ColumnDragHandle({
+  onDrag,
+  onDragStart,
+  onDragEnd,
+}: {
+  onDrag: (deltaX: number) => void;
+  onDragStart?: () => void;
+  onDragEnd?: () => void;
+}) {
+  const startXRef = useRef(0);
+  const [dragging, setDragging] = useState(false);
+
+  const handlePointerDown = useCallback(
+    (e: ReactPointerEvent) => {
+      e.preventDefault();
+      startXRef.current = e.clientX;
+      const el = e.currentTarget as HTMLElement;
+      el.setPointerCapture(e.pointerId);
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      setDragging(true);
+      onDragStart?.();
+
+      const handleMove = (ev: globalThis.PointerEvent) => {
+        const delta = ev.clientX - startXRef.current;
+        startXRef.current = ev.clientX;
+        onDrag(delta);
+      };
+
+      const handleUp = () => {
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        setDragging(false);
+        onDragEnd?.();
+        document.removeEventListener("pointermove", handleMove);
+        document.removeEventListener("pointerup", handleUp);
+      };
+
+      document.addEventListener("pointermove", handleMove);
+      document.addEventListener("pointerup", handleUp);
+    },
+    [onDrag, onDragStart, onDragEnd],
+  );
+
+  return (
+    <div
+      className="shrink-0 w-3 cursor-col-resize group relative z-10 flex items-center justify-center"
+      onPointerDown={handlePointerDown}
+    >
+      <div
+        className={`w-1 rounded-full transition-opacity duration-150 bg-bg-tertiary ${
+          dragging ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+        }`}
+        style={{ position: "absolute", top: 48, bottom: 48 }}
+      />
+    </div>
+  );
+}
+
 type ViewState = "notes" | "settings";
 
-function AppContent() {
+interface AppContentProps {
+  columnWidths: { padNav: number; sidebar: number };
+  padNavOpen: boolean;
+  padNavVisible: boolean;
+  padNavPeeking: boolean;
+  sidebarVisible: boolean;
+  isDragging: boolean;
+  togglePadNav: () => void;
+  toggleSidebar: () => void;
+  setSidebarVisible: (visible: boolean) => void;
+  dismissPeek: () => void;
+  onPadNavPeekEnter: () => void;
+  onPadNavPeekLeave: () => void;
+  onPadNavDrag: (delta: number) => void;
+  onSidebarDrag: (delta: number) => void;
+  onDragStart: () => void;
+  onDragEnd: () => void;
+}
+
+function AppContent({
+  columnWidths,
+  padNavOpen,
+  padNavVisible,
+  padNavPeeking,
+  sidebarVisible,
+  isDragging,
+  togglePadNav,
+  toggleSidebar,
+  setSidebarVisible,
+  dismissPeek,
+  onPadNavPeekEnter,
+  onPadNavPeekLeave,
+  onPadNavDrag,
+  onSidebarDrag,
+  onDragStart,
+  onDragEnd,
+}: AppContentProps) {
   const {
-    notesFolder,
     isLoading,
     createNote,
     notes,
@@ -52,28 +176,22 @@ function AppContent() {
   } = useNotes();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [view, setView] = useState<ViewState>("notes");
-  const [sidebarVisible, setSidebarVisible] = useState(true);
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiEditing, setAiEditing] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
   const [aiProvider, setAiProvider] = useState<AiProvider>("claude");
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const editorRef = useRef<TiptapEditor | null>(null);
-
-  const toggleSidebar = useCallback(() => {
-    setSidebarVisible((prev) => !prev);
-  }, []);
 
   const toggleFocusMode = useCallback(() => {
     setFocusMode((prev) => {
-      // Don't enter focus mode without a selected note
       if (!prev && !selectedNoteId) return prev;
       if (prev) {
-        // Exiting focus mode — always restore sidebar
         setSidebarVisible(true);
       }
       return !prev;
     });
-  }, [selectedNoteId]);
+  }, [selectedNoteId, setSidebarVisible]);
 
   const toggleSettings = useCallback(() => {
     setView((prev) => (prev === "settings" ? "notes" : "settings"));
@@ -320,31 +438,75 @@ function AppContent() {
 
   if (isLoading) {
     return (
-      <div className="h-screen flex items-center justify-center bg-bg-secondary">
+      <div className="h-full flex items-center justify-center">
         <div className="text-text-muted/70 text-sm flex items-center gap-1.5 font-medium">
           <SpinnerIcon className="w-4.5 h-4.5 stroke-[1.5] animate-spin" />
-          Initializing Scratch...
+          Loading notes...
         </div>
       </div>
     );
   }
 
-  if (!notesFolder) {
-    return <FolderPicker />;
-  }
-
   return (
     <>
-      <div className="h-screen flex bg-bg overflow-hidden">
+      <div className="h-full flex animate-content-crossfade">
         {view === "settings" ? (
           <SettingsPage onBack={closeSettings} />
         ) : (
           <>
+            {/* Column 1: Pad/folder navigation — floating panel with margin */}
+            {!focusMode && sidebarVisible && (
+              <div className="relative shrink-0 flex" data-tauri-drag-region>
+                {/* Peek hover zone when pad nav is closed */}
+                {!padNavOpen && (
+                  <div
+                    className="absolute inset-y-0 left-0 w-2 z-30"
+                    onMouseEnter={onPadNavPeekEnter}
+                    onMouseLeave={onPadNavPeekLeave}
+                  />
+                )}
+                <div
+                  className={`h-full overflow-hidden ${isDragging ? "" : "transition-[width] duration-300 ease-out"}`}
+                  style={{ width: padNavVisible ? `${columnWidths.padNav}px` : 0 }}
+                  onMouseLeave={padNavPeeking ? onPadNavPeekLeave : undefined}
+                >
+                  <div
+                    className="h-full flex flex-col p-2 pt-0"
+                    style={{ width: `${columnWidths.padNav}px` }}
+                  >
+                    <PadNav
+                      selectedFolder={selectedFolder}
+                      onSelectFolder={(folder) => {
+                        setSelectedFolder(folder);
+                        if (padNavPeeking) dismissPeek();
+                      }}
+                    />
+                  </div>
+                </div>
+                {padNavVisible && (
+                  <ColumnDragHandle onDrag={onPadNavDrag} onDragStart={onDragStart} onDragEnd={onDragEnd} />
+                )}
+              </div>
+            )}
+            {/* Column 2: Note list */}
             <div
-              className={`transition-all duration-500 ease-out overflow-hidden ${!sidebarVisible || focusMode ? "opacity-0 -translate-x-4 w-0 pointer-events-none" : "opacity-100 translate-x-0 w-64"}`}
+              className={`overflow-hidden shrink-0 flex ${isDragging ? "" : "transition-all duration-500 ease-out"} ${!sidebarVisible || focusMode ? "opacity-0 -translate-x-4 w-0 pointer-events-none" : "opacity-100 translate-x-0"}`}
+              style={sidebarVisible && !focusMode ? { width: `${columnWidths.sidebar}px` } : undefined}
             >
-              <Sidebar onOpenSettings={toggleSettings} />
+              <div className="flex-1 min-w-0">
+                <Sidebar
+                  selectedFolder={selectedFolder}
+                  onOpenSettings={toggleSettings}
+                  onTogglePadNav={togglePadNav}
+                  padNavOpen={padNavOpen}
+                />
+              </div>
             </div>
+            {/* Drag handle for sidebar/editor boundary */}
+            {sidebarVisible && !focusMode && (
+              <ColumnDragHandle onDrag={onSidebarDrag} onDragStart={onDragStart} onDragEnd={onDragEnd} />
+            )}
+            {/* Column 3: Editor */}
             <Editor
               onToggleSidebar={toggleSidebar}
               sidebarVisible={sidebarVisible && !focusMode}
@@ -485,6 +647,111 @@ function UpdateToast({
   );
 }
 
+function PadAwareApp() {
+  const { pads, activePadId, isLoading, padVersion } = usePads();
+
+  const [columnWidths, setColumnWidths] = useState(loadColumnWidths);
+  const [padNavOpen, setPadNavOpen] = useState(true);
+  const [padNavPeeking, setPadNavPeeking] = useState(false);
+  const padNavPeekTimer = useRef<number | null>(null);
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const padNavVisible = padNavOpen || padNavPeeking;
+
+  const togglePadNav = useCallback(() => {
+    setPadNavOpen((prev) => !prev);
+    setPadNavPeeking(false);
+  }, []);
+
+  const handlePadNavPeekEnter = useCallback(() => {
+    if (padNavOpen) return;
+    padNavPeekTimer.current = window.setTimeout(() => {
+      setPadNavPeeking(true);
+    }, 200);
+  }, [padNavOpen]);
+
+  const handlePadNavPeekLeave = useCallback(() => {
+    if (padNavPeekTimer.current) {
+      clearTimeout(padNavPeekTimer.current);
+      padNavPeekTimer.current = null;
+    }
+    setPadNavPeeking(false);
+  }, []);
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarVisible((prev) => !prev);
+  }, []);
+
+  const handleSetSidebarVisible = useCallback((visible: boolean) => {
+    setSidebarVisible(visible);
+  }, []);
+
+  const dismissPeek = useCallback(() => {
+    setPadNavPeeking(false);
+  }, []);
+
+  const handlePadNavDrag = useCallback((delta: number) => {
+    setColumnWidths((prev) => {
+      const padNav = Math.max(PAD_NAV_MIN, Math.min(PAD_NAV_MAX, prev.padNav + delta));
+      const next = { ...prev, padNav };
+      try { localStorage.setItem("scratch-column-widths", JSON.stringify(next)); } catch { /* */ }
+      return next;
+    });
+  }, []);
+
+  const handleSidebarDrag = useCallback((delta: number) => {
+    setColumnWidths((prev) => {
+      const sidebar = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, prev.sidebar + delta));
+      const next = { ...prev, sidebar };
+      try { localStorage.setItem("scratch-column-widths", JSON.stringify(next)); } catch { /* */ }
+      return next;
+    });
+  }, []);
+
+  if (isLoading) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-bg-secondary">
+        <div className="text-text-muted/70 text-sm flex items-center gap-1.5 font-medium">
+          <SpinnerIcon className="w-4.5 h-4.5 stroke-[1.5] animate-spin" />
+          Initializing Scratch...
+        </div>
+      </div>
+    );
+  }
+
+  if (pads.length === 0 || !activePadId) {
+    return <FolderPicker />;
+  }
+
+  return (
+    <div className="h-screen bg-bg-secondary overflow-hidden">
+      <NotesProvider key={`pad-${activePadId}-${padVersion}`}>
+        <GitProvider>
+          <AppContent
+            columnWidths={columnWidths}
+            padNavOpen={padNavOpen}
+            padNavVisible={padNavVisible}
+            padNavPeeking={padNavPeeking}
+            sidebarVisible={sidebarVisible}
+            isDragging={isDragging}
+            togglePadNav={togglePadNav}
+            toggleSidebar={toggleSidebar}
+            setSidebarVisible={handleSetSidebarVisible}
+            dismissPeek={dismissPeek}
+            onPadNavPeekEnter={handlePadNavPeekEnter}
+            onPadNavPeekLeave={handlePadNavPeekLeave}
+            onPadNavDrag={handlePadNavDrag}
+            onSidebarDrag={handleSidebarDrag}
+            onDragStart={() => setIsDragging(true)}
+            onDragEnd={() => setIsDragging(false)}
+          />
+        </GitProvider>
+      </NotesProvider>
+    </div>
+  );
+}
+
 function App() {
   const { isPreview, previewFile } = useMemo(getWindowMode, []);
 
@@ -520,11 +787,9 @@ function App() {
     <ThemeProvider>
       <Toaster />
       <TooltipProvider>
-        <NotesProvider>
-          <GitProvider>
-            <AppContent />
-          </GitProvider>
-        </NotesProvider>
+        <PadsProvider>
+          <PadAwareApp />
+        </PadsProvider>
       </TooltipProvider>
     </ThemeProvider>
   );

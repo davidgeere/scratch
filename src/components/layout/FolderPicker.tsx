@@ -1,10 +1,10 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useNotes } from "../../context/NotesContext";
+import { usePads } from "../../context/PadsContext";
 import { useTheme } from "../../context/ThemeContext";
 import { Button } from "../ui";
 
 export function FolderPicker() {
-  const { setNotesFolder } = useNotes();
+  const { addPad } = usePads();
   const { reloadSettings } = useTheme();
 
   const handleSelectFolder = async () => {
@@ -16,8 +16,9 @@ export function FolderPicker() {
       });
 
       if (selected && typeof selected === "string") {
-        await setNotesFolder(selected);
-        // Reload theme/font settings from the new folder's .scratch/settings.json
+        const name =
+          selected.split("/").filter(Boolean).pop() || "Notes";
+        await addPad(name, selected);
         await reloadSettings();
       }
     } catch (err) {
@@ -27,7 +28,6 @@ export function FolderPicker() {
 
   return (
     <div className="h-full flex flex-col bg-bg-secondary">
-      {/* Draggable title bar area */}
       <div className="h-10 shrink-0" data-tauri-drag-region />
 
       <div className="flex-1 flex items-center justify-center">
@@ -57,7 +57,7 @@ export function FolderPicker() {
             style={{ animationDelay: "200ms" }}
           >
             <Button onClick={handleSelectFolder} size="xl">
-              Choose your notes folder
+              Add your first pad
             </Button>
           </div>
 
@@ -65,7 +65,8 @@ export function FolderPicker() {
             className="mt-2 text-xs text-text-muted/60 animate-fade-in-up"
             style={{ animationDelay: "300ms" }}
           >
-            You can change this later
+            Each pad connects to a folder on your computer. You can add more
+            later.
           </p>
         </div>
       </div>
